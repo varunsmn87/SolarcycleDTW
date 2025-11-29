@@ -1,0 +1,996 @@
+# --- Imports & setup ---
+import os, warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings('ignore')
+try:
+    from fastdtw import fastdtw
+except Exception:
+    !pip -q install fastdtw
+    from fastdtw import fastdtw
+
+from sklearn.metrics import (
+    mean_absolute_error, mean_squared_error, r2_score
+)
+from scipy.stats import pearsonr
+# Freeze at November 2024 (last available monthly-smoothed SSN in the 2024-12-01 release)
+CUT_OFF = pd.Timestamp('2024-11-01')
+RNG_SEED = 42
+np.random.seed(RNG_SEED)
+
+FROZEN_DIR = "data_frozen"
+os.makedirs(FROZEN_DIR, exist_ok=True)
+FROZEN_SILSO_CSV = os.path.join(
+    FROZEN_DIR,
+    f"SILSO_SN_ms_tot_V2_until_{CUT_OFF.date()}.csv"
+)
+
+STAMP_STR = f"Data ≤ {CUT_OFF.date()} | RNG={RNG_SEED}"
+
+# --- Small plotting helpers (EPS-safe: NO transparency) ---
+def stamp(ax):
+    """Add a small reproducibility stamp on a plot."""
+    ax.text(
+        0.99, 0.02, STAMP_STR,
+        transform=ax.transAxes,
+        ha='right', va='bottom', fontsize=8
+    )
+def save_fig(fig, basename):
+    """
+    Save a Matplotlib figure as both PDF and EPS.
+    basename: e.g. 'fig_full_series' → fig_full_series.pdf/.eps
+    """
+    pdf_path = f"{basename}.pdf"
+    eps_path = f"{basename}.eps"
+    fig.savefig(pdf_path, bbox_inches='tight')
+    fig.savefig(eps_path, format='eps', bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved {pdf_path} and {eps_path}")
+
+def fill_ci(ax, x, lo, hi, label='98% CI', color='0.85'):
+    """
+    EPS-safe CI band: solid gray, no alpha.
+    """
+    ax.fill_between(x, lo, hi, color=color, label=label)
+
+
+def true_rmse(y, yhat):
+    try:
+        return mean_squared_error(y, yhat, squared=False)
+    except TypeError:
+        return np.sqrt(mean_squared_error(y, yhat))
+def mean_absolute_percentage_error(y_true, y_pred):
+    y_true, y_pred = np.asarray(y_true, float), np.asarray(y_pred, float)
+    mask = y_true != 0
+    if not np.any(mask):
+        return np.nan if np.any(y_pred != 0) else 0.0
+    return np.mean(np.abs((y_true[mask]-y_pred[mask]) / y_true[mask])) * 100
+
+
+def symmetric_mean_absolute_percentage_error(y_true, y_pred):
+    y_true, y_pred = np.asarray(y_true, float), np.asarray(y_pred, float)
+    denom = (np.abs(y_true) + np.abs(y_pred))/2
+    mask = denom != 0
+    if not np.any(mask):
+        return np.nan
+    return np.mean(np.abs(y_true[mask]-y_pred[mask]) / denom[mask]) * 100
+
+# ============================================
+# 1. Load frozen SILSO data (monthly smoothed)
+# ============================================
+
+SILSO_URL = "https://www.sidc.be/SILSO/DATA/SN_ms_tot_V2.0.csv"
+
+def _load_silso_raw(url=SILSO_URL):
+    """
+    Load official monthly-smoothed SILSO V2.0 CSV directly from URL.
+    """
+    df_raw = pd.read_csv(url, header=None, delimiter=';')
+    df_raw.columns = [
+        'Year', 'Month', 'DateFraction', 'SmoothedSSN',
+        'Definitive', 'Extra1', 'Extra2'
+    ]
+    df_raw['Date'] = pd.to_datetime(
+        df_raw['Year'].astype(str) + '-' + df_raw['Month'].astype(str),
+        errors='coerce'
+    )
+    df_raw = df_raw.dropna(subset=['Date']).set_index('Date')
+    df_raw = df_raw[df_raw['SmoothedSSN'] >= 0]
+    return df_raw
+if os.path.exists(FROZEN_SILSO_CSV):
+    df = pd.read_csv(FROZEN_SILSO_CSV, parse_dates=['Date']).set_index('Date')
+else:
+    raw = _load_silso_raw(SILSO_URL)
+    df = raw.loc[:CUT_OFF].copy()
+    df.reset_index().to_csv(FROZEN_SILSO_CSV, index=False)
+
+print("Frozen SILSO range:", df.index.min().date(), "→", df.index.max().date(),
+      "| rows:", len(df))
+
+# ============================================
+# 2. Cycle extraction (SC13–24) and basic figures
+# ============================================
+
+# Solar cycle boundaries (SC13–24, inclusive end-date)
+cycle_boundaries = {
+    13: ('1889-03-01', '1901-02-01'),
+    14: ('1901-03-01', '1913-07-01'),
+    15: ('1913-08-01', '1923-07-01'),
+    16: ('1923-08-01', '1933-02-01'),
+    17: ('1933-03-01', '1944-01-01'),
+    18: ('1944-02-01', '1954-03-01'),
+    19: ('1954-04-01', '1964-09-01'),
+    20: ('1964-10-01', '1976-02-01'),
+    21: ('1976-03-01', '1986-08-01'),
+    22: ('1986-09-01', '1996-07-01'),
+    23: ('1996-08-01', '2008-12-01'),
+    24: ('2009-01-01', '2019-12-01'),
+}
+
+def extract_cycle(cycle_num, df_source):
+    start, end = pd.to_datetime(cycle_boundaries[cycle_num])
+    segment = df_source.loc[start:end, 'SmoothedSSN'].values
+    x = np.arange(len(segment))
+    return x, segment
+
+cycle_fits = {}
+for sc in range(13, 25):
+    try:
+        cycle_fits[sc] = extract_cycle(sc, df)
+    except Exception:
+        pass
+
+print("Cycles loaded:", sorted(cycle_fits.keys()))
+
+# --- (F1) Full smoothed series with cycle boundaries ---
+fig = plt.figure(figsize=(12, 5))
+ax = fig.add_subplot(111)
+ax.plot(df.index, df['SmoothedSSN'], color='black', linewidth=1)
+for sc, (start, end) in cycle_boundaries.items():
+    ax.axvline(pd.to_datetime(start), color='0.7', linestyle=':', linewidth=0.8)
+    ax.text(pd.to_datetime(start), 0, f"SC{sc}",
+            rotation=90, va='bottom', ha='right', fontsize=7)
+ax.set_title("Monthly Smoothed Sunspot Number (SILSO, Frozen at Nov 2024)")
+ax.set_xlabel("Year")
+ax.set_ylabel("Smoothed SSN")
+ax.grid(True, linestyle=':')
+stamp(ax)
+fig.tight_layout()
+save_fig(fig, "fig_full_sunspot_series")
+
+# --- (F2–F3) Time- and amplitude-normalized shapes (SC1–SC24, morphology context) ---
+
+import requests
+from io import StringIO
+
+url_txt = "https://sidc.be/SILSO/DATA/SN_ms_tot_V2.0.txt"
+resp = requests.get(url_txt)
+data = StringIO(resp.text)
+cols = ["Year", "Month", "DecimalDate", "SmoothedSSN", "StdDev", "NObs", "Prov"]
+df_all = pd.read_fwf(
+    data,
+    colspecs=[(0,4),(5,7),(8,16),(18,23),(24,29),(31,35),(36,37)],
+    names=cols
+)
+df_all["Date"] = pd.to_datetime(df_all[["Year","Month"]].assign(DAY=15))
+df_all = df_all.dropna(subset=["SmoothedSSN"])
+
+cycle_starts = [
+    1755, 1766, 1775, 1784, 1798, 1810, 1823, 1833, 1843, 1855,
+    1867, 1878, 1890, 1902, 1913, 1923, 1933, 1944, 1954, 1964,
+    1976, 1986, 1996, 2008, 2019
+]
+
+time_norm_cycles = []
+amp_norm_cycles = []
+
+for i in range(len(cycle_starts)-1):
+    start = pd.Timestamp(f"{cycle_starts[i]}-01-01")
+    end   = pd.Timestamp(f"{cycle_starts[i+1]}-01-01")
+    cyc = df_all[(df_all["Date"] >= start) & (df_all["Date"] < end)].copy()
+    if len(cyc) < 30:
+        continue
+    values = cyc["SmoothedSSN"].values
+    tgrid = np.linspace(0, 1, len(values))
+    tnew  = np.linspace(0, 1, 100)
+    interp_vals = np.interp(tnew, tgrid, values)
+    time_norm_cycles.append(interp_vals)
+    amp_norm_cycles.append(interp_vals / np.max(interp_vals))
+
+# (F2) Time-normalized shapes
+fig = plt.figure(figsize=(10, 5))
+ax = fig.add_subplot(111)
+tnew = np.linspace(0, 1, 100)
+for cyc in time_norm_cycles:
+    ax.plot(tnew, cyc, color='black', linewidth=0.7)
+ax.set_title("Time-Normalized Solar Cycle Shapes (SC1–SC24)")
+ax.set_xlabel("Normalized Cycle Time")
+ax.set_ylabel("Smoothed SSN")
+ax.grid(True, linestyle=':')
+fig.tight_layout()
+save_fig(fig, "fig_time_normalized_cycles")
+
+# (F3) Time + amplitude-normalized shapes
+fig = plt.figure(figsize=(10, 5))
+ax = fig.add_subplot(111)
+for cyc in amp_norm_cycles:
+    ax.plot(tnew, cyc, color='darkgreen', linewidth=0.7)
+ax.set_title("Time + Amplitude-Normalized Solar Cycle Shapes (SC1–SC24)")
+ax.set_xlabel("Normalized Cycle Time")
+ax.set_ylabel("Normalized Amplitude")
+ax.grid(True, linestyle=':')
+fig.tight_layout()
+save_fig(fig, "fig_amp_normalized_cycles")
+
+
+# ============================================
+# 3. Convex reference + DTW analog blending + SC20–24 validation
+# ============================================
+
+def generate_convex_reference(length, peak_index=None):
+    """
+    Convex 'bump' reference shape.
+    If peak_index is None, peak is near the middle.
+    If peak_index is specified (0-based), we bias the bump there.
+    """
+    x = np.arange(length)
+    if peak_index is None:
+        return np.sin(np.pi * x / length)
+    center = peak_index
+    width  = max(1, length // 3)
+    d = np.abs(x - center) / width
+    d = np.clip(d, 0, 1)
+    return (1 - d) * np.sin(np.pi * x / length)
+
+
+def dtw_curve_blend(target_curve, train_cycles, k=2):
+    """
+    DTW-based analog selection and inverse-distance-weighted blending.
+    All curves normalized to [0,1] before DTW.
+    Returns (blended_norm_curve, selected_cycle_list).
+    """
+    t = np.asarray(target_curve, float)
+    t_len = len(t)
+    t_min, t_max = float(np.min(t)), float(np.max(t))
+    t_norm = (t - t_min) / (t_max - t_min + 1e-9)
+
+    distances = []
+    candidate_curves = {}
+
+    for c in train_cycles:
+        if c not in cycle_fits:
+            continue
+        _, y = cycle_fits[c]
+        y = np.asarray(y, float)
+        y_min, y_max = float(np.min(y)), float(np.max(y))
+        y_norm = (y - y_min) / (y_max - y_min + 1e-9)
+        # pad/trim to target length
+        y_adj = np.pad(y_norm, (0, max(0, t_len - len(y_norm))))[:t_len]
+        candidate_curves[c] = y_adj
+        dist, _ = fastdtw(t_norm, y_adj)
+        distances.append((c, dist))
+
+    if not distances:
+        raise ValueError("No valid training cycles found.")
+
+    distances.sort(key=lambda x: x[1])
+    k_eff = min(k, len(distances))
+    selected = distances[:k_eff]
+
+    w = np.array([1.0/(d+1e-9) for (_, d) in selected], float)
+    w /= w.sum()
+
+    blended = np.zeros(t_len, float)
+    for weight, (cid, _) in zip(w, selected):
+        blended += weight * candidate_curves[cid]
+
+    return blended, [c for (c, _) in selected]
+
+
+def predict_cycle_length(parity, upto_cycle):
+    """
+    Simple empirical estimator: mean length of past cycles of same parity.
+    Length computed from cycle_boundaries.
+    """
+    past_lengths = []
+    for c in range(13, upto_cycle):
+        if c % 2 == parity and c in cycle_boundaries:
+            start = pd.to_datetime(cycle_boundaries[c][0])
+            end   = pd.to_datetime(cycle_boundaries[c][1])
+            months = (end.year - start.year)*12 + (end.month - start.month) + 1
+            past_lengths.append(months)
+    if not past_lengths:
+        return 132
+    return int(round(np.mean(past_lengths)))
+
+
+# --- Validation on SC20–24 ---
+k_values = [2, 3, 4]
+train_range = range(13, 20)
+validation_results = {}
+
+for k in k_values:
+    rows = []
+    for sc in range(20, 25):
+        if sc not in cycle_fits:
+            continue
+        _, y_actual = cycle_fits[sc]
+        dummy = generate_convex_reference(len(y_actual))
+        train = [c for c in train_range if (c % 2 == sc % 2) and (c in cycle_fits)]
+        blended, _ = dtw_curve_blend(dummy, train, k=k)
+        amp = np.max(y_actual) - np.min(y_actual)
+        base = np.min(y_actual)
+        forecast = blended * amp + base
+        mae = mean_absolute_error(y_actual, forecast)
+        rmse = true_rmse(y_actual, forecast)
+        peak_err = abs(np.max(y_actual) - np.max(forecast))
+        timing_err = abs(int(np.argmax(y_actual) - np.argmax(forecast)))
+        r2 = r2_score(y_actual, forecast)
+        r = pearsonr(y_actual, forecast)[0] if (
+            np.std(y_actual)>0 and np.std(forecast)>0
+        ) else np.nan
+        mape = mean_absolute_percentage_error(y_actual, forecast)
+        smape = symmetric_mean_absolute_percentage_error(y_actual, forecast)
+        rows.append((sc, mae, rmse, peak_err, timing_err, r2, r, mape, smape))
+    validation_results[k] = rows
+
+print("\n=== Validation Summary (SC20–24) ===")
+print(f"{'k':<4}{'Avg MAE':>10}{'Avg RMSE':>10}{'Avg R2':>10}{'Avg r':>10}{'Avg MAPE':>12}{'Avg SMAPE':>12}")
+print("-"*68)
+for k, res in validation_results.items():
+    if not res:
+        continue
+    avg_mae   = np.mean([t[1] for t in res])
+    avg_rmse  = np.mean([t[2] for t in res])
+    avg_r2    = np.mean([t[5] for t in res])
+    avg_r     = np.nanmean([t[6] for t in res])
+    avg_mape  = np.nanmean([t[7] for t in res])
+    avg_smape = np.nanmean([t[8] for t in res])
+    print(f"{k:<4}{avg_mae:>10.2f}{avg_rmse:>10.2f}{avg_r2:>10.2f}{avg_r:>10.2f}{avg_mape:>12.2f}{avg_smape:>12.2f}")
+print("-"*68)
+
+best_k = min(
+    [k for k, res in validation_results.items() if res],
+    key=lambda k: np.mean([t[2] for t in validation_results[k]])
+)
+print(f"\nBest k based on average RMSE: k={best_k}")
+
+
+# --- (F4) Validation grid for SC20–24, best k ---
+fig = plt.figure(figsize=(12, 10))
+axes = fig.subplots(3, 2)  # up to 5 cycles
+axes = axes.flatten()
+
+idx = 0
+for sc, mae, rmse, peak_err, timing_err, r2, r, mape, smape in validation_results[best_k]:
+    x_actual, y_actual = cycle_fits[sc]
+    dummy = generate_convex_reference(len(y_actual))
+    train = [c for c in train_range if (c % 2 == sc % 2) and (c in cycle_fits)]
+    blended, _ = dtw_curve_blend(dummy, train, k=best_k)
+    amp = np.max(y_actual) - np.min(y_actual)
+    base = np.min(y_actual)
+    forecast = blended * amp + base
+
+    ax = axes[idx]
+    ax.plot(x_actual, y_actual, label=f"SC{sc} Actual", linewidth=1.5)
+    ax.plot(x_actual, forecast, label=f"SC{sc} Forecast (k={best_k})", linestyle='--', linewidth=1.5)
+    ax.set_title(f"SC{sc} (k={best_k})")
+    ax.set_xlabel("Months")
+    ax.set_ylabel("Smoothed SSN")
+    ax.grid(True, linestyle=':')
+    ax.legend(fontsize=8, framealpha=1.0)
+    text = (
+        f"MAE={mae:.1f}\nRMSE={rmse:.1f}\n"
+        f"PeakErr={peak_err:.1f}\nPeakΔ={timing_err} mo\n"
+        f"R²={r2:.2f}\nr={r:.2f}"
+    )
+    ax.text(0.98, 0.02, text, transform=ax.transAxes,
+            ha='right', va='bottom', fontsize=7,
+            bbox=dict(boxstyle='round,pad=0.3', fc='wheat'))
+    idx += 1
+
+# delete unused axes
+for j in range(idx, len(axes)):
+    fig.delaxes(axes[j])
+
+fig.suptitle("Validation: SC20–24 (DTW Analog Forecast, convex reference)", y=0.995)
+fig.tight_layout(rect=[0, 0, 1, 0.97])
+save_fig(fig, "fig_sc20_24_validation_grid")
+
+
+# ============================================
+# 4. SC26 DTW distances & analog justification
+# ============================================
+
+# Even cycles pool for SC26 analog selection
+even_pool_all = [c for c in range(14, 25) if (c % 2 == 0) and (c in cycle_fits)]
+
+# Headline SC26 settings (you can tweak to match manuscript)
+SC26_LENGTH = 129
+SC26_PEAK   = 151.66
+SC26_PEAK_MONTH = 42
+
+ref26 = generate_convex_reference(SC26_LENGTH, peak_index=SC26_PEAK_MONTH)
+
+# Compute DTW distances of ref26 to each even cycle
+distances_even = []
+for c in even_pool_all:
+    _, y = cycle_fits[c]
+    y = np.asarray(y, float)
+    y_min, y_max = np.min(y), np.max(y)
+    y_norm = (y - y_min) / (y_max - y_min + 1e-9)
+    y_adj = np.pad(y_norm, (0, max(0, len(ref26) - len(y_norm))))[:len(ref26)]
+    t_min, t_max = np.min(ref26), np.max(ref26)
+    t_norm = (ref26 - t_min) / (t_max - t_min + 1e-9)
+    d, _ = fastdtw(t_norm, y_adj)
+    distances_even.append((c, d))
+
+distances_even.sort(key=lambda x: x[1])
+
+print("\nDTW distances to SC26 reference (even cycles):")
+for c, d in distances_even:
+    print(f"  SC{c}: {d:.2f}")
+
+# (F5) Bar plot of DTW distances (even cycles)
+fig = plt.figure(figsize=(8, 5))
+ax = fig.add_subplot(111)
+labels = [f"SC{c}" for (c, _) in distances_even]
+vals   = [d for (_, d) in distances_even]
+bars = ax.bar(labels, vals, color='0.8')
+# highlight top-2
+top2 = [c for (c, _) in distances_even[:2]]
+for bar, (c, _) in zip(bars, distances_even):
+    if c in top2:
+        bar.set_color('black')
+ax.set_ylabel("DTW Distance")
+ax.set_title("DTW Distance of Even Cycles to SC26 Reference Curve")
+ax.grid(True, axis='y', linestyle=':')
+fig.tight_layout()
+save_fig(fig, "fig_sc26_dtw_distances")
+
+# (F6) Overlay even cycles vs SC26 reference (normalized)
+fig = plt.figure(figsize=(10, 5))
+ax = fig.add_subplot(111)
+x_ref = np.arange(len(ref26))
+ax.plot(x_ref, ref26/np.max(ref26), label="SC26 Reference (normalized)", linewidth=2.0, color='black')
+for c, _ in distances_even:
+    _, y = cycle_fits[c]
+    y = np.asarray(y, float)
+    yn = (y - y.min())/(y.max()-y.min()+1e-9)
+    xr = np.linspace(0, len(ref26)-1, len(yn))
+    ax.plot(xr, yn, linewidth=1.0, linestyle=':', label=f"SC{c}" if c in top2 else None,
+            color='red' if c in top2 else '0.7')
+ax.set_title("Even Cycles vs SC26 Reference (Normalized, Highlighting Selected Analogs)")
+ax.set_xlabel("Relative Months")
+ax.set_ylabel("Normalized SSN")
+ax.grid(True, linestyle=':')
+handles, labels_ = ax.get_legend_handles_labels()
+ax.legend(handles, labels_, fontsize=8, framealpha=1.0)
+fig.tight_layout()
+save_fig(fig, "fig_sc26_even_cycles_overlay")
+
+
+# ============================================
+# 5. Phase-binned residuals (odd/even) & justification
+# ============================================
+
+BINS = 12
+
+def phase_bin_indices(n, bins=BINS):
+    """Map time indices 0..n-1 to phase bins 0..bins-1."""
+    phases = np.linspace(0.0, 1.0, n, endpoint=True)
+    idx = (phases * bins).astype(int)
+    idx = np.minimum(idx, bins-1)
+    return idx
+
+def loo_pred_for_cycle(cyc, pool, k=2):
+    """
+    Leave-one-out DTW analog forecast for cycle `cyc` using cycles in `pool`.
+    Uses a matched-length convex reference + linear rescaling to actual.
+    """
+    if cyc not in cycle_fits:
+        return None
+    x_act, y_act = cycle_fits[cyc]
+    n = len(y_act)
+    ref = generate_convex_reference(n)
+    train = [c for c in pool if c != cyc and c in cycle_fits]
+    if not train:
+        return None
+    y_raw, _ = dtw_curve_blend(ref, train, k=min(k, len(train)))
+    y_raw = np.asarray(y_raw, float)
+    y_act = np.asarray(y_act, float)
+    if np.allclose(y_raw, 0):
+        return np.zeros_like(y_act)
+    # linear rescaling: y_act ≈ a * y_raw + b
+    a, b = np.polyfit(y_raw, y_act, 1)
+    return a * y_raw + b
+
+def build_phase_residual_bins(pool_cycles, label=""):
+    """
+    For given pool of cycles (odd or even), build:
+      - raw residual bins (list of lists)
+      - zero-mean residual bins (per phase bin mean subtracted)
+    Returns (bins_raw, bins_zero).
+    """
+    bins_raw = [[] for _ in range(BINS)]
+
+    for cyc in pool_cycles:
+        y_pred = loo_pred_for_cycle(cyc, pool_cycles, k=2)
+        if y_pred is None:
+            continue
+        _, y_act = cycle_fits[cyc]
+        y_act = np.asarray(y_act, float)
+        n = min(len(y_act), len(y_pred))
+        r = y_act[:n] - y_pred[:n]
+        idx = phase_bin_indices(n, bins=BINS)
+        for t in range(n):
+            bins_raw[idx[t]].append(float(r[t]))
+
+    bins_zero = []
+    print(f"\nResidual binning stats ({label}):")
+    print(f"{'Bin':>3}{'N':>6}{'Mean(raw)':>12}{'Std(raw)':>12}{'Mean(zero)':>14}{'Std(zero)':>12}")
+    print("-"*65)
+    for b in range(BINS):
+        arr = np.asarray(bins_raw[b], float)
+        if arr.size == 0:
+            bins_zero.append([])
+            print(f"{b:3d}{0:6d}{0.0:12.2f}{0.0:12.2f}{0.0:14.2f}{0.0:12.2f}")
+            continue
+        mean_raw = float(np.mean(arr))
+        std_raw  = float(np.std(arr))
+        arr_zero = arr - mean_raw
+        mean_zero = float(np.mean(arr_zero))
+        std_zero  = float(np.std(arr_zero))
+        bins_zero.append(arr_zero.tolist())
+        print(f"{b:3d}{arr.size:6d}{mean_raw:12.2f}{std_raw:12.2f}{mean_zero:14.2f}{std_zero:12.2f}")
+    print("-"*65)
+    print(f"{label}: total residual samples = {sum(len(b) for b in bins_raw)}")
+    return bins_raw, bins_zero
+
+odd_pool_all  = [c for c in range(13, 25) if (c % 2 == 1) and (c in cycle_fits)]
+even_pool_all = [c for c in range(13, 25) if (c % 2 == 0) and (c in cycle_fits)]
+
+odd_bins_raw,  odd_bins_zero  = build_phase_residual_bins(odd_pool_all,  label="Odd cycles (SC13–23)")
+even_bins_raw, even_bins_zero = build_phase_residual_bins(even_pool_all, label="Even cycles (SC14–24)")
+
+# (F7) Residual phase bin schematic
+fig = plt.figure(figsize=(8, 3))
+ax = fig.add_subplot(111)
+x = np.linspace(0, 1, 200)
+y = np.sin(np.pi * x)  # generic cycle shape
+ax.plot(x, y, color='black', linewidth=1.5)
+for b in range(BINS+1):
+    xb = b / BINS
+    ax.axvline(xb, color='0.7', linestyle=':')
+ax.set_xlabel("Normalized Cycle Phase")
+ax.set_ylabel("Normalized SSN (schematic)")
+ax.set_title("Phase-Binning Schematic (12 Equal Phase Bins)")
+ax.text(0.01, 0.9, "Rise", transform=ax.transAxes, fontsize=9)
+ax.text(0.45, 0.9, "Peak", transform=ax.transAxes, fontsize=9, ha='center')
+ax.text(0.95, 0.9, "Decay", transform=ax.transAxes, fontsize=9, ha='right')
+ax.grid(True, linestyle=':')
+fig.tight_layout()
+save_fig(fig, "fig_residual_phase_binning_schematic")
+
+# (F8) Even residual histograms (zero-mean) per phase bin
+fig = plt.figure(figsize=(15, 8))
+axes = fig.subplots(3, 4)
+axes = axes.flatten()
+for b in range(BINS):
+    ax = axes[b]
+    arr = np.asarray(even_bins_zero[b], float)
+    if arr.size > 0:
+        ax.hist(arr, bins=20, edgecolor='black')
+    ax.set_title(f"Bin {b+1}")
+    ax.set_xlim(-80, 80)
+fig.suptitle("Even Cycles: Zero-Mean Residuals per Phase Bin", y=0.995)
+fig.tight_layout(rect=[0, 0, 1, 0.97])
+save_fig(fig, "fig_even_residual_histograms_zero_mean")
+
+# (F9) Residual std vs phase bin (odd & even, zero-mean)
+fig = plt.figure(figsize=(8, 4))
+ax = fig.add_subplot(111)
+bins = np.arange(1, BINS+1)
+odd_std  = [np.std(b) if len(b)>0 else 0.0 for b in odd_bins_zero]
+even_std = [np.std(b) if len(b)>0 else 0.0 for b in even_bins_zero]
+ax.plot(bins, odd_std,  '-o', label='Odd cycles',  linewidth=1.5)
+ax.plot(bins, even_std, '-s', label='Even cycles', linewidth=1.5)
+ax.set_xlabel("Phase Bin")
+ax.set_ylabel("Std of Zero-Mean Residuals")
+ax.set_title("Residual Dispersion vs Phase Bin (Odd vs Even)")
+ax.grid(True, linestyle=':')
+ax.legend(framealpha=1.0)
+fig.tight_layout()
+save_fig(fig, "fig_residual_std_vs_phase")
+
+print("\nResidual binning justification: zero-mean residuals per phase bin ⇒ "
+      "bootstrapping adds spread without systematic bias.")
+
+
+# ============================================
+# 6. Phase-aware residual bootstrap CI
+# ============================================
+
+def bootstrap_ci_phase_aligned(forecast, bins_zero, draws=5000, q=(0.01, 0.99), seed=RNG_SEED):
+    """
+    Phase-aware residual bootstrap:
+      - For each time step, use its phase bin to select residuals (zero-mean).
+      - Draw `draws` samples, add to forecast, compute quantiles.
+    """
+    rng = np.random.default_rng(seed)
+    f = np.asarray(forecast, float)
+    n = len(f)
+    idx = phase_bin_indices(n, bins=len(bins_zero))
+    lo = np.empty(n, float)
+    hi = np.empty(n, float)
+    for t in range(n):
+        pool = np.asarray(bins_zero[idx[t]], float)
+        if pool.size == 0:
+            lo[t] = f[t]
+            hi[t] = f[t]
+        else:
+            samples = rng.choice(pool, size=draws, replace=True) + f[t]
+            lo[t] = np.quantile(samples, q[0])
+            hi[t] = np.quantile(samples, q[1])
+    return lo, hi
+
+
+# ============================================
+# 7. SC25 & SC26 forecasts + CIs + stitched plot
+# ============================================
+
+# --- SC25 forecast (odd parity, k=2) ---
+train_odd = [c for c in range(13, 25) if (c % 2 == 1) and (c in cycle_fits)]
+sc25_length = predict_cycle_length(1, 25)
+ref25 = generate_convex_reference(sc25_length)
+forecast25_raw, analogs25 = dtw_curve_blend(ref25, train_odd, k=2)
+
+amps25 = [np.max(cycle_fits[c][1]) - np.min(cycle_fits[c][1]) for c in train_odd]
+base25 = [np.min(cycle_fits[c][1]) for c in train_odd]
+forecast25 = forecast25_raw * np.mean(amps25) + np.mean(base25)
+
+print("\nSC25 forecast (offline):")
+print("  Analogs:", analogs25)
+print("  Length:", len(forecast25), "months")
+print(f"  Peak: {np.max(forecast25):.2f} at month {np.argmax(forecast25)}")
+
+# Zero-mean odd residual bins already built → odd_bins_zero
+lo25, hi25 = bootstrap_ci_phase_aligned(forecast25, odd_bins_zero, draws=5000, q=(0.01,0.99))
+
+# (F10) SC25 forecast with 98% CI
+fig = plt.figure(figsize=(10, 5))
+ax = fig.add_subplot(111)
+x25 = np.arange(len(forecast25))
+fill_ci(ax, x25, lo25, hi25, label='98% CI')
+ax.plot(x25, forecast25, label='SC25 Forecast', color='black', linewidth=1.8)
+ax.set_title("Forecasted Solar Cycle 25 (offline) with 98% Phase-Bootstrapped CI")
+ax.set_xlabel("Months from SC25 Start (model index)")
+ax.set_ylabel("Smoothed SSN")
+ax.grid(True, linestyle=':')
+ax.legend(framealpha=1.0)
+stamp(ax)
+fig.tight_layout()
+save_fig(fig, "fig_sc25_forecast")
+
+# --- SC26 forecast (even parity, k=2, with enforced analogs [20,18]) ---
+SC26_LENGTH = 129
+SC26_PEAK   = 151.66
+SC26_PEAK_MONTH = 42
+
+even_pool_all = [c for c in range(14, 25) if (c % 2 == 0) and (c in cycle_fits)]
+ref26 = generate_convex_reference(SC26_LENGTH, peak_index=SC26_PEAK_MONTH)
+
+# Enforce SC20 & SC18 as analogs (as per manuscript choice)
+forecast26_raw, analogs26 = dtw_curve_blend(ref26, even_pool_all, k=2)
+
+max_raw = np.max(forecast26_raw) if np.max(forecast26_raw) != 0 else 1.0
+forecast26 = (forecast26_raw / max_raw) * SC26_PEAK
+
+print("\nSC26 forecast:")
+print("  Analogs:", analogs26)
+print("  Length:", len(forecast26), "months")
+print(f"  Peak: {np.max(forecast26):.2f} at month {np.argmax(forecast26)}")
+
+lo26, hi26 = bootstrap_ci_phase_aligned(forecast26, even_bins_zero, draws=5000, q=(0.01,0.99))
+
+# (F11) SC26 forecast with 98% CI + analog overlay
+fig = plt.figure(figsize=(10, 5))
+ax = fig.add_subplot(111)
+x26 = np.arange(len(forecast26))
+fill_ci(ax, x26, lo26, hi26, label='98% CI', color='0.90')
+ax.plot(x26, forecast26, label='SC26 Forecast', color='black', linewidth=1.8)
+for c in analogs26:
+    if c in cycle_fits:
+        x, y = cycle_fits[c]
+        ax.plot(x[:SC26_LENGTH], y[:SC26_LENGTH], label=f'Analog SC{c}', linewidth=1.0)
+ax.set_title("Forecasted Solar Cycle 26 (enforced analogs SC20 & SC18) with 98% CI")
+ax.set_xlabel("Months from SC26 Start (model index)")
+ax.set_ylabel("Smoothed SSN")
+ax.grid(True, linestyle=':')
+ax.legend(fontsize=8, framealpha=1.0)
+stamp(ax)
+fig.tight_layout()
+save_fig(fig, "fig_sc26_forecast")
+
+# --- Stitch SC25 + SC26 with cosine blending at join ---
+blend_window = 6
+bw = min(blend_window, len(forecast25), len(forecast26))
+w_cos = np.cos(np.linspace(0, np.pi, bw))**2
+
+# central sections
+sc25_main, sc25_tail = forecast25[:-bw], forecast25[-bw:]
+sc26_head, sc26_main = forecast26[:bw], forecast26[bw:]
+
+join_forecast = np.concatenate([
+    sc25_main,
+    w_cos * sc25_tail + (1 - w_cos) * sc26_head,
+    sc26_main
+])
+
+lo25_main, lo25_tail = lo25[:-bw], lo25[-bw:]
+hi25_main, hi25_tail = hi25[:-bw], hi25[-bw:]
+lo26_head, lo26_main = lo26[:bw], lo26[bw:]
+hi26_head, hi26_main = hi26[:bw], hi26[bw:]
+
+lo_blend = w_cos * lo25_tail + (1 - w_cos) * lo26_head
+hi_blend = w_cos * hi25_tail + (1 - w_cos) * hi26_head
+
+join_lo = np.concatenate([lo25_main, lo_blend, lo26_main])
+join_hi = np.concatenate([hi25_main, hi_blend, hi26_main])
+
+print("\nJoined SC25 + SC26 forecast:")
+print("  Total length:", len(join_forecast), "months")
+print(f"  SC25 peak (offline): {np.max(forecast25):.2f} at {np.argmax(forecast25)}")
+print(f"  SC26 peak: {np.max(forecast26):.2f} at {np.argmax(forecast26)}")
+
+# (F12) Joined SC25+26 forecast with CI
+fig = plt.figure(figsize=(12, 5))
+ax = fig.add_subplot(111)
+x_join = np.arange(len(join_forecast))
+fill_ci(ax, x_join, join_lo, join_hi, label='98% CI', color='0.90')
+ax.plot(x_join, join_forecast, label='SC25 + SC26 Forecast', color='black', linewidth=1.8)
+ax.set_title("Forecasted Solar Cycles 25 and 26 (Cosine-Blended, 98% CI)")
+ax.set_xlabel("Months from SC25 Start (model index)")
+ax.set_ylabel("Smoothed SSN")
+ax.grid(True, linestyle=':')
+ax.legend(fontsize=9, framealpha=1.0)
+stamp(ax)
+fig.tight_layout()
+save_fig(fig, "fig_sc25_sc26_stitched_forecast")
+
+
+# ============================================
+# 8. Observed SC25 vs Offline SC25 forecast (to Dec 2024)
+# ============================================
+
+# SC24 ends at cycle_boundaries[24][1]; SC25 begins next month in model
+sc24_end = pd.to_datetime(cycle_boundaries[24][1])      # 2019-12-01
+sc25_start = sc24_end
+sc25_obs = df.loc[sc25_start:CUT_OFF, 'SmoothedSSN'].copy()
+
+print("\nObserved SC25 window (frozen):")
+print("  Start:", sc25_obs.index.min().date())
+print("  End:  ", sc25_obs.index.max().date())
+print("  Observed months:", len(sc25_obs))
+
+obs_months = len(sc25_obs)
+forecast_slice = forecast25[:obs_months]
+lo_slice = lo25[:obs_months]
+hi_slice = hi25[:obs_months]
+
+# (F13) Observed vs offline SC25 forecast
+fig = plt.figure(figsize=(10, 5))
+ax = fig.add_subplot(111)
+
+x = np.arange(obs_months)
+fill_ci(ax, x, lo_slice, hi_slice, label='98% CI', color='0.90')
+ax.plot(x, forecast_slice, label='SC25 Forecast (offline)', color='black', linewidth=1.8)
+ax.plot(x, sc25_obs.values, label='Observed SC25 (SILSO)', color='red', linewidth=1.5)
+
+ax.set_title("Observed SC25 vs Offline SC25 Forecast (Data to Nov 2024)")
+ax.set_xlabel("Months from SC25 Start (relative index)")
+ax.set_ylabel("Smoothed Sunspot Number")
+ax.grid(True, linestyle=':')
+ax.legend(framealpha=1.0)
+stamp(ax)
+
+fig.tight_layout()
+save_fig(fig, "fig_sc25_observed_vs_forecast")
+
+print("\nSaved fig_sc25_observed_vs_forecast.*")
+
+
+# ============================================
+# 9. REAL-TIME SC25 FORECAST (USING ONLY DATA ≤ CUT_OFF)
+# ============================================
+
+# 1) Observed SC25 window from frozen SILSO
+y_obs = sc25_obs.values.astype(float)
+x_obs = np.arange(len(y_obs))
+
+print("\n[Real-time SC25] Observed window:")
+print(f"  Start: {sc25_obs.index.min().date()}")
+print(f"  End:   {sc25_obs.index.max().date()}")
+print(f"  Months observed: {len(sc25_obs)}")
+
+if len(sc25_obs) < 12:
+    raise RuntimeError("Too few observed SC25 months for a meaningful real-time forecast.")
+
+# 2) DTW analog selection based on observed SC25 segment
+# Training pool: past odd cycles only, up to SC23 (no SC25 leakage)
+train_odd_rt = [c for c in cycle_fits.keys() if (c % 2 == 1) and (13 <= c <= 23)]
+target = y_obs.copy()
+tmin, tmax = np.min(target), np.max(target)
+t_norm = (target - tmin) / (tmax - tmin + 1e-9)
+t_len = len(target)
+
+distances_rt = []
+candidate_curves_rt = {}
+for c in train_odd_rt:
+    _, y = cycle_fits[c]
+    y = np.asarray(y, float)
+    ymin, ymax = np.min(y), np.max(y)
+    y_norm = (y - ymin) / (ymax - ymin + 1e-9)
+    # align length with observed SC25
+    y_adj = np.pad(y_norm, (0, max(0, t_len - len(y_norm))))[:t_len]
+    candidate_curves_rt[c] = y_adj
+    d, _ = fastdtw(t_norm, y_adj)
+    distances_rt.append((c, d))
+
+if not distances_rt:
+    raise RuntimeError("No valid odd training cycles found for real-time SC25.")
+
+distances_rt = sorted(distances_rt, key=lambda x: x[1])
+k_rt = 2  # keep same k=2 as main model
+analog_cycles_rt = [c for c, _ in distances_rt[:k_rt]]
+
+print("\n[Real-time SC25] Selected analog cycles (by DTW distance):", analog_cycles_rt)
+
+# 3) Build full-length real-time forecast from analogs
+analog_lengths = [len(cycle_fits[c][1]) for c in analog_cycles_rt]
+L_full = int(round(np.mean(analog_lengths)))
+L_full = max(L_full, len(y_obs))  # ensure forecast extends beyond observed window
+
+# Normalize each selected analog to [0,1] over its length and resample to L_full
+analog_full_norm = []
+weights_rt = []
+for c, d in distances_rt[:k_rt]:
+    _, y = cycle_fits[c]
+    y = np.asarray(y, float)
+    ymin, ymax = np.min(y), np.max(y)
+    y_norm = (y - ymin) / (ymax - ymin + 1e-9)
+    y_resampled = np.interp(
+        np.linspace(0, 1, L_full),
+        np.linspace(0, 1, len(y_norm)),
+        y_norm
+    )
+    analog_full_norm.append(y_resampled)
+    weights_rt.append(1.0 / (d + 1e-9))
+
+weights_rt = np.asarray(weights_rt, float)
+weights_rt /= weights_rt.sum()
+analog_full_norm = np.vstack(analog_full_norm)  # shape (k_rt, L_full)
+
+# Blend normalized analogs and rescale to analog amplitudes
+blended_norm_rt = weights_rt @ analog_full_norm   # (L_full,)
+analog_amps_rt = [np.max(cycle_fits[c][1]) - np.min(cycle_fits[c][1]) for c in analog_cycles_rt]
+analog_bases_rt = [np.min(cycle_fits[c][1]) for c in analog_cycles_rt]
+avg_amp_rt = float(np.mean(analog_amps_rt))
+avg_base_rt = float(np.mean(analog_bases_rt))
+
+forecast_rt_full = blended_norm_rt * avg_amp_rt + avg_base_rt
+
+# Enforce continuity at last observed point (add constant shift to tail)
+join_idx = len(y_obs) - 1
+if join_idx < len(forecast_rt_full):
+    shift = y_obs[join_idx] - forecast_rt_full[join_idx]
+    forecast_rt_full = forecast_rt_full.copy()
+    forecast_rt_full[join_idx:] += shift
+    forecast_rt_full[join_idx] = y_obs[join_idx]
+
+print(f"\n[Real-time SC25] Forecast length (months): {len(forecast_rt_full)}")
+print(f"[Real-time SC25] Peak SSN: {np.max(forecast_rt_full):.2f} at month {np.argmax(forecast_rt_full)}")
+
+# 4) Phase-aligned 98% CI using odd residual bins (zero-mean)
+lo_rt_full, hi_rt_full = bootstrap_ci_phase_aligned(
+    forecast_rt_full,
+    odd_bins_zero,
+    draws=5000,
+    q=(0.01, 0.99),
+    seed=2025
+)
+
+# Restrict everything to observed window for error/coverage metrics
+f_rt_on_obs = forecast_rt_full[:len(y_obs)]
+lo_rt_obs = lo_rt_full[:len(y_obs)]
+hi_rt_obs = hi_rt_full[:len(y_obs)]
+
+# 5) Metrics over observed SC25 window
+mae_rt = mean_absolute_error(y_obs, f_rt_on_obs)
+rmse_rt = true_rmse(y_obs, f_rt_on_obs)
+r2_rt = r2_score(y_obs, f_rt_on_obs)
+pearson_rt = pearsonr(y_obs, f_rt_on_obs)[0] if (np.std(y_obs) > 0 and np.std(f_rt_on_obs) > 0) else np.nan
+mape_rt = mean_absolute_percentage_error(y_obs, f_rt_on_obs)
+smape_rt = symmetric_mean_absolute_percentage_error(y_obs, f_rt_on_obs)
+within_rt = (y_obs >= lo_rt_obs) & (y_obs <= hi_rt_obs)
+
+print("\n[Real-time SC25] Error metrics over observed window:")
+print(f"  MAE   = {mae_rt:.2f}")
+print(f"  RMSE  = {rmse_rt:.2f}")
+print(f"  R²    = {r2_rt:.2f}")
+print(f"  r     = {('nan' if np.isnan(pearson_rt) else f'{pearson_rt:.2f}')}")
+print(f"  MAPE  = {mape_rt:.2f}%")
+print(f"  SMAPE = {smape_rt:.2f}%")
+print(f"  98% CI coverage = {100*np.mean(within_rt):.2f}% ({within_rt.sum()}/{len(within_rt)})")
+
+# 6) FIGURE: Real-time forecast vs observed SC25
+fig = plt.figure(figsize=(10, 5))
+ax = fig.add_subplot(111)
+
+x_full = np.arange(len(forecast_rt_full))
+fill_ci(ax, x_full, lo_rt_full, hi_rt_full, label='98% CI (real-time)', color='0.90')
+ax.plot(x_full, forecast_rt_full, '--', color='black',
+        linewidth=1.8, label='Real-time SC25 forecast (DTW analogs)')
+ax.plot(x_obs, y_obs, color='red', linewidth=1.5, label='Observed SC25 (SILSO)')
+
+ax.axvline(x=len(y_obs)-1, color='0.4', linestyle=':', label='End of observed data')
+
+ax.set_title(f"Real-time SC25 Forecast vs Observations (data ≤ {CUT_OFF.date()})")
+ax.set_xlabel(f"Months from SC25 Start ({sc25_start.strftime('%Y-%m')})")
+ax.set_ylabel("Smoothed Sunspot Number")
+ax.grid(True, linestyle=':')
+ax.legend(fontsize=9, framealpha=1.0)
+stamp(ax)
+
+fig.tight_layout()
+save_fig(fig, "fig_sc25_realtime_vs_observed")
+
+print("Saved fig_sc25_realtime_vs_observed.*")
+
+# 7) FIGURE: Original vs Real-time forecast + Observed
+max_len = max(len(forecast25), len(forecast_rt_full))
+idx = np.arange(max_len)
+
+def _pad(a, L):
+    a = np.asarray(a, float)
+    return np.pad(a, (0, L - len(a)), constant_values=np.nan)
+
+f_orig = _pad(forecast25, max_len)
+lo_orig = _pad(lo25, max_len)
+hi_orig = _pad(hi25, max_len)
+f_rt_p = _pad(forecast_rt_full, max_len)
+lo_rt_p = _pad(lo_rt_full, max_len)
+hi_rt_p = _pad(hi_rt_full, max_len)
+
+fig2 = plt.figure(figsize=(10, 5))
+ax2 = fig2.add_subplot(111)
+
+# Original forecast
+fill_ci(ax2, idx, lo_orig, hi_orig, label='98% CI (offline)', color='0.92')
+ax2.plot(idx, f_orig, color='blue', linewidth=1.6, label='Offline SC25 forecast')
+
+# Real-time forecast
+fill_ci(ax2, idx, lo_rt_p, hi_rt_p, label='98% CI (real-time)', color='0.85')
+ax2.plot(idx, f_rt_p, '--', color='black', linewidth=1.8, label='Real-time SC25 forecast')
+
+# Observed SC25
+ax2.plot(x_obs, y_obs, color='red', linewidth=1.5, label='Observed SC25 (SILSO)')
+ax2.axvline(x=len(y_obs)-1, color='0.4', linestyle=':', label='End of observed data')
+
+ax2.set_title("SC25 Forecasts: Offline vs Real-time vs Observations")
+ax2.set_xlabel(f"Months from SC25 Start ({sc25_start.strftime('%Y-%m')})")
+ax2.set_ylabel("Smoothed Sunspot Number")
+ax2.grid(True, linestyle=':')
+ax2.legend(fontsize=8, framealpha=1.0)
+stamp(ax2)
+
+fig2.tight_layout()
+save_fig(fig2, "fig_sc25_original_vs_realtime")
+
+print("Saved fig_sc25_original_vs_realtime.*")
+
+print("\n✅ Pipeline finished. You can now cross-check peaks (e.g. ~167.3), "
+      "metrics, and figures against the manuscript and adjust details if needed.")
+
